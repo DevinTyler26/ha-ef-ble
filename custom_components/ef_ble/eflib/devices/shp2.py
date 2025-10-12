@@ -18,6 +18,14 @@ from ..props.protobuf_field import TransformIfMissing
 pb_time = proto_attr_mapper(pd303_pb2.ProtoTime)
 pb_push_set = proto_attr_mapper(pd303_pb2.ProtoPushAndSet)
 
+class PowerStatus(IntFieldValue):
+    UNKNOWN = -1
+
+    GRID_POWER = 0
+    BATTERY_POWER = 1
+    OIL_POWER = 2
+    EMERGENCY_STOP = 3
+    OFF_POWER = 4
 
 class ControlStatus(IntFieldValue):
     UNKNOWN = -1
@@ -86,6 +94,7 @@ class Device(DeviceBase, ProtobufProps):
     NUM_OF_CIRCUITS = 12
     NUM_OF_CHANNELS = 3
 
+    power_status = pb_field(pb_push_set.power_sta, PowerStatus.from_value)
     battery_level = pb_field(pb_push_set.backup_incre_info.backup_bat_per)
 
     circuit_power_1 = CircuitPowerField(0)
@@ -365,6 +374,10 @@ class Device(DeviceBase, ProtobufProps):
         TransformIfMissing(lambda v: v if v is not None else 0.0),
     )
 
+    smart_backup_mode = pb_field(pb_push_set.smart_backup_mode)
+    backup_enabled = pb_field(pb_push_set.backup_reserve_enable)
+    backup_battery_level = pb_field(pb_push_set.backup_reserve_soc)
+
     errors = pb_field(pb_push_set.backup_incre_info.errcode, _errors)
     error_count = Field[int]()
     error_happened = Field[bool]()
@@ -467,16 +480,20 @@ class Device(DeviceBase, ProtobufProps):
 
         return processed
 
+    async def _send_config_packet(self, message):
+        payload = message.SerializeToString()
+        packet = Packet(0x21, 0x0B, 0x0C, 0x21, payload, 0x01, 0x01, 0x13)
+        await self._conn.sendPacket(packet)
+
     async def set_config_flag(self, enable):
         """Send command to enable/disable sending config data from device to the host"""
         self._logger.debug("%s: setConfigFlag: %s", self._address, enable)
 
         ppas = pd303_pb2.ProtoPushAndSet()
         ppas.is_get_cfg_flag = enable
-        payload = ppas.SerializeToString()
-        packet = Packet(0x21, 0x0B, 0x0C, 0x21, payload, 0x01, 0x01, 0x13)
 
-        await self._conn.sendPacket(packet)
+        await self._send_config_packet(ppas)
+        return True
 
     async def set_circuit_power(self, circuit_id, enable):
         """Send command to power on / off the specific circuit of the panel"""
@@ -492,7 +509,24 @@ class Device(DeviceBase, ProtobufProps):
             pd303_pb2.LOAD_CH_POWER_ON if enable else pd303_pb2.LOAD_CH_POWER_OFF
         )
         sta.ctrl_mode = pd303_pb2.RLY_HAND_CTRL_MODE
-        payload = ppas.SerializeToString()
-        packet = Packet(0x21, 0x0B, 0x0C, 0x21, payload, 0x01, 0x01, 0x13)
 
-        await self._conn.sendPacket(packet)
+        await self._send_config_packet(ppas)
+        return True
+
+    async def set_backup_battery_level(self, value: int):
+        self._logger.debug(
+            "%s: set_backup_battery_level: %d", self._address, value
+        )
+        ppas = pd303_pb2.ProtoPushAndSet()
+        ppas.backup_reserve_soc = value
+        await self._send_config_packet(ppas)
+        return True
+
+    async def set_smart_backup_mode(self, value: int):
+        self._logger.debug(
+            "%s: set_smart_backup_mode: %d", self._address, value
+        )
+        ppas = pd303_pb2.ProtoPushAndSet()
+        ppas.smart_backup_mode = value
+        await self._send_config_packet(ppas)
+        return True

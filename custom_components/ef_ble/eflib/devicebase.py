@@ -225,7 +225,7 @@ class DeviceBase(abc.ABC):
                 # let first few messages update as soon as they come, otherwise everything
                 # would display unknown until first period ends
                 if self._wait_until_throttle == 0:
-                    self._wait_until_throttle = now + 5
+                    self._wait_until_throttle = now + 20
                 elif self._wait_until_throttle < now:
                     self._wait_until_throttle = None
 
