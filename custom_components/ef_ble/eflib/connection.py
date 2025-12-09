@@ -524,84 +524,102 @@ class Connection:
 
         return payload_data
 
-    async def parseEncPackets(self, data: str) -> list[Packet]:
-        """Deserializes bytes stream into a list of Packets"""
-        # In case there are leftovers from previous processing - adding them to current
-        # data
-        if self._enc_packet_buffer:
-            data = self._enc_packet_buffer + data
-            self._enc_packet_buffer = b""
+    async def parseEncPackets(self, data: bytes) -> list[Packet]:
+    """Deserializes bytes stream into a list of Packets"""
 
-        self._logger.log_filtered(
-            LogOptions.ENCRYPTED_PAYLOADS,
-            "parseEncPackets: Data: %r",
-            bytearray(data).hex(),
+    # Append leftover data from previous partial packet
+    if self._enc_packet_buffer:
+        data = self._enc_packet_buffer + data
+        self._enc_packet_buffer = b""
+
+    if not data:
+        return []
+
+    self._logger.log_filtered(
+        LogOptions.ENCRYPTED_PAYLOADS,
+        "parseEncPackets: Data: %r",
+        data.hex(),
+    )
+
+    # SHP3 frequently emits empty / short encrypted frames — drop quietly
+    if len(data) < 8:
+        self._logger.debug(
+            "%s: Dropping short encrypted packet (%d bytes)",
+            self._address,
+            len(data),
         )
-        if len(data) < 8:
-            error_msg = (
-                "parseEncPackets: Unable to parse encrypted packet - too small: %r"
-            )
-            self._logger.error(error_msg, bytearray(data).hex())
-            size = len(data) if data is not None else -1
+        return []
+
+    packets: list[Packet] = []
+
+    while data:
+        # Prefix mismatch = not a VX protocol packet (normal on SHP3)
+        if not data.startswith(EncPacket.PREFIX):
             self._logger.debug(
-                "%s: Dropping short encrypted packet (%d bytes)",
+                "%s: Dropping encrypted packet (bad prefix): %s",
                 self._address,
-                size,
+                data.hex(),
             )
-            return []
+            return packets
 
-        # Data can contain multiple EncPackets and even incomplete ones, so walking
-        # through
-        packets = []
-        while data:
-            if not data.startswith(EncPacket.PREFIX):
-                error_msg = (
-                    "parseEncPackets: Unable to parse encrypted packet - prefix is "
-                    "incorrect: %r"
-                )
-                self._logger.error(error_msg, bytearray(data).hex())
-                return packets
+        header = data[0:6]
+        data_len = struct.unpack("<H", header[4:6])[0]
+        data_end = 6 + data_len
 
-            header = data[0:6]
-            data_end = 6 + struct.unpack("<H", header[4:6])[0]
-            if data_end > len(data):
-                self._enc_packet_buffer += data
-                break
+        # Incomplete packet → buffer for later
+        if data_end > len(data):
+            self._enc_packet_buffer = data
+            break
 
-            payload_data = data[6 : data_end - 2]
-            payload_crc = data[data_end - 2 : data_end]
+        payload_data = data[6 : data_end - 2]
+        payload_crc = data[data_end - 2 : data_end]
 
-            # Move to next data packet
-            data = data[data_end:]
+        # Advance stream
+        data = data[data_end:]
 
-            try:
-                # Check the packet CRC16
-                if crc16(header + payload_data) != struct.unpack("<H", payload_crc)[0]:
-                    error_msg = "Unable to parse encrypted packet - incorrect CRC16: %r"
-                    self._logger.error(error_msg, bytearray(payload_data).hex())
-                    raise PacketParseError  # noqa: TRY301
+        # CRC missing or malformed → drop
+        if len(payload_crc) < 2:
+            self._logger.debug(
+                "%s: Dropping encrypted packet (missing CRC)",
+                self._address,
+            )
+            continue
 
-                # Decrypt the payload packet
-                payload = await self.decryptSession(payload_data)
-                self._logger.log_filtered(
-                    LogOptions.DECRYPTED_PAYLOADS,
-                    "parseEncPackets: decrypted payload: %r",
-                    bytearray(payload).hex(),
-                )
+        # CRC mismatch → drop
+        if crc16(header + payload_data) != struct.unpack("<H", payload_crc)[0]:
+            self._logger.debug(
+                "%s: Dropping encrypted packet (CRC mismatch)",
+                self._address,
+            )
+            continue
 
-                # Parse packet
-                packet = await self._packet_parse(payload)
-                self._logger.log_filtered(
-                    LogOptions.PACKETS,
-                    "Parsed packet: %s",
-                    packet,
-                )
-                if packet is not None:
-                    packets.append(packet)
-            except Exception as e:  # noqa: BLE001
-                await self.add_error(e)
+        try:
+            # Decrypt payload
+            payload = await self.decryptSession(payload_data)
 
-        return packets
+            self._logger.log_filtered(
+                LogOptions.DECRYPTED_PAYLOADS,
+                "parseEncPackets: decrypted payload: %r",
+                payload.hex(),
+            )
+
+            # Parse higher-level packet
+            packet = await self._packet_parse(payload)
+
+            if packet is not None:
+                packets.append(packet)
+
+        except Exception as exc:  # noqa: BLE001
+            # Encrypted garbage is EXPECTED on SHP3 — never fatal
+            self._logger.debug(
+                "%s: Dropping encrypted packet (parse error): %s",
+                self._address,
+                exc,
+            )
+            continue
+
+    return packets
+
 
     async def sendRequest(self, send_data: bytes, response_handler=None):
         self._logger.log_filtered(
