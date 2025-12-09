@@ -762,7 +762,14 @@ class Connection:
             return
 
         self._set_state(ConnectionState.SESSION_KEY_RECEIVED)
-        await self._client.stop_notify(Connection.NOTIFY_CHARACTERISTIC)
+        try:
+            await self._client.stop_notify(Connection.NOTIFY_CHARACTERISTIC)
+        except Exception as exc:
+            self._logger.debug(
+                "%s: stop_notify skipped (no active notify session): %s",
+                self._address,
+                exc,
+            )
         encrypted_data = await self.parseSimple(bytes(recv_data))
 
         if encrypted_data[0] != 0x02:
