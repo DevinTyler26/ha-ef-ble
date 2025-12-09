@@ -23,14 +23,6 @@ pb_push_set = proto_attr_mapper(pd303_pb2.ProtoPushAndSet)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _merge_hall_values(*halls: Sequence[float] | None) -> list[float]:
-    vals: list[float] = []
-    for h in halls:
-        if h:
-            vals.extend(h)
-    return vals
-
-
 def _errors(error_codes: pd303_pb2.ErrCode):
     if not error_codes or not error_codes.err_code:
         return []
@@ -40,17 +32,33 @@ def _errors(error_codes: pd303_pb2.ErrCode):
     ]
 
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
+def _get_hall_value(
+    pb,
+    idx: int,
+    attr: str,
+) -> float | None:
+    """
+    Resolve circuit values across hall1 / hall2 / hall3.
 
-class ControlStatus(IntFieldValue):
-    UNKNOWN = -1
-    OFF = 0
-    DISCHARGE = 1
-    CHARGE = 2
-    EMERGENCY_STOP = 3
-    STANDBY = 4
+    hall1: circuits  1–12
+    hall2: circuits 13–24
+    hall3: circuits 25–32
+    """
+    halls = [
+        pb.load_info.hall1_watt if attr == "watt" else pb.load_info.hall1_curr,
+        pb.load_info.hall2_watt if attr == "watt" else pb.load_info.hall2_curr,
+        pb.load_info.hall3_watt if attr == "watt" else pb.load_info.hall3_curr,
+    ]
+
+    base = 0
+    for hall in halls:
+        if not hall:
+            continue
+        if base <= idx < base + len(hall):
+            return hall[idx - base]
+        base += len(hall)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -59,38 +67,24 @@ class ControlStatus(IntFieldValue):
 
 @dataclass
 class CircuitPowerField(
-    repeated_pb_field_type(
-        list_field=lambda pb: _merge_hall_values(
-            pb.load_info.hall1_watt,
-            pb.load_info.hall2_watt,
-            pb.load_info.hall3_watt,
-        )
-    )
+    repeated_pb_field_type(list_field=pb_time.load_info.hall1_watt)
 ):
     idx: int
 
-    def get_item(self, value: Sequence[float]) -> float | None:
-        if not value or self.idx >= len(value):
-            return None
-        return round(value[self.idx], 2)
+    def get_item(self, pb) -> float | None:
+        val = _get_hall_value(pb, self.idx, "watt")
+        return round(val, 2) if val is not None else None
 
 
 @dataclass
 class CircuitCurrentField(
-    repeated_pb_field_type(
-        list_field=lambda pb: _merge_hall_values(
-            pb.load_info.hall1_curr,
-            pb.load_info.hall2_curr,
-            pb.load_info.hall3_curr,
-        )
-    )
+    repeated_pb_field_type(list_field=pb_time.load_info.hall1_curr)
 ):
     idx: int
 
-    def get_item(self, value: Sequence[float]) -> float | None:
-        if not value or self.idx >= len(value):
-            return None
-        return round(value[self.idx], 4)
+    def get_item(self, pb) -> float | None:
+        val = _get_hall_value(pb, self.idx, "curr")
+        return round(val, 4) if val is not None else None
 
 
 @dataclass
@@ -247,70 +241,6 @@ class Device(DeviceBase, ProtobufProps):
     async def set_config_flag(self, enable: bool):
         ppas = pd303_pb2.ProtoPushAndSet()
         ppas.is_get_cfg_flag = enable
-
-        packet = Packet(
-            0x21,
-            0x0B,
-            0x0C,
-            0x21,
-            ppas.SerializeToString(),
-            0x01,
-            0x01,
-            0x13,
-        )
-
-        await self._conn.sendPacket(packet)
-
-    # ---------------------------------------------------------------------
-    # Control (guarded)
-    # ---------------------------------------------------------------------
-
-    async def enable_circuit_control(self):
-        self._logger.warning(
-            "%s: Enabling SHP3 circuit control — USE WITH CAUTION",
-            self._address,
-        )
-        self._enable_circuit_control = True
-
-    async def set_circuit_power(self, circuit_id: int, enable: bool):
-        if not self._enable_circuit_control:
-            self._logger.warning(
-                "%s: Circuit control blocked (circuit=%d)",
-                self._address,
-                circuit_id,
-            )
-            return
-
-        if circuit_id < 0 or circuit_id >= self.NUM_OF_CIRCUITS:
-            self._logger.error(
-                "%s: Invalid circuit id %d",
-                self._address,
-                circuit_id,
-            )
-            return
-
-        ppas = pd303_pb2.ProtoPushAndSet()
-
-        sta = getattr(
-            ppas.load_incre_info.hall1_incre_info,
-            f"ch{circuit_id + 1}_sta",
-            None,
-        )
-
-        if sta is None:
-            self._logger.error(
-                "%s: Unable to resolve control field for circuit %d",
-                self._address,
-                circuit_id,
-            )
-            return
-
-        sta.load_sta = (
-            pd303_pb2.LOAD_CH_POWER_ON
-            if enable
-            else pd303_pb2.LOAD_CH_POWER_OFF
-        )
-        sta.ctrl_mode = pd303_pb2.RLY_HAND_CTRL_MODE
 
         packet = Packet(
             0x21,
