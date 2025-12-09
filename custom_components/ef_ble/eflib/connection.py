@@ -534,7 +534,12 @@ class Connection:
                 "parseEncPackets: Unable to parse encrypted packet - too small: %r"
             )
             self._logger.error(error_msg, bytearray(data).hex())
-            raise EncPacketParseError
+            self._logger.debug(
+                "%s: Dropping short encrypted packet (%d bytes)",
+                self._address,
+                len(recv_data),
+            )
+            return []
 
         # Data can contain multiple EncPackets and even incomplete ones, so walking
         # through
