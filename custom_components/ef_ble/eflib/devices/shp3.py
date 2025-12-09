@@ -111,9 +111,8 @@ class Device(DeviceBase, ProtobufProps):
     """
     EcoFlow Smart Home Panel 3 (SHP3)
 
-    DEBUG / BRING-UP BUILD:
-    - Logs decoded protobuf content
-    - Enables config streaming at the correct lifecycle point
+    • Telemetry is event-driven
+    • Config streaming MUST be enabled AFTER auth
     """
 
     SN_PREFIX = (b"P101", b"HR63")
@@ -178,8 +177,7 @@ class Device(DeviceBase, ProtobufProps):
     ) -> None:
         super().__init__(ble_dev, adv_data, sn)
         self._time_commands = TimeCommands(self)
-        # IMPORTANT:
-        # Do NOT touch self._conn here – it does not exist yet.
+        self._cfg_enabled = False
 
     # ---------------------------------------------------------------------
     # Packet parsing
@@ -200,19 +198,23 @@ class Device(DeviceBase, ProtobufProps):
                 await self._conn.replyPacket(packet)
                 self.update_from_bytes(pd303_pb2.ProtoTime, packet.payload)
 
-                # DEBUG – inspect ProtoTime content
+                # DEBUG — confirm mapping
                 self._logger.debug(
-                    "%s: ProtoTime decoded:\n%s",
-                    self.address,
-                    pb_time,
-                )
-                self._logger.debug(
-                    "%s: hall1_watt=%s hall2_watt=%s hall3_watt=%s",
+                    "%s: ProtoTime decoded hall1=%s hall2=%s hall3=%s",
                     self.address,
                     pb_time.load_info.hall1_watt,
                     pb_time.load_info.hall2_watt,
                     pb_time.load_info.hall3_watt,
                 )
+
+                # Fallback: ensure config streaming once telemetry starts
+                if not self._cfg_enabled:
+                    self._cfg_enabled = True
+                    self._logger.debug(
+                        "%s: First ProtoTime → enabling config streaming",
+                        self.address,
+                    )
+                    self._conn._add_task(self.set_config_flag(True))
 
                 processed = True
 
@@ -222,14 +224,6 @@ class Device(DeviceBase, ProtobufProps):
                     pd303_pb2.ProtoPushAndSet,
                     packet.payload,
                 )
-
-                # DEBUG – inspect ProtoPushAndSet content
-                self._logger.debug(
-                    "%s: ProtoPushAndSet decoded:\n%s",
-                    self.address,
-                    pb_push_set,
-                )
-
                 processed = True
 
         # -----------------------------------------------------------------
@@ -246,19 +240,19 @@ class Device(DeviceBase, ProtobufProps):
             processed = True
 
         # -----------------------------------------------------------------
-        # Device online → enable config streaming (CORRECT PLACE)
+        # Online-ready → enable config streaming
         # -----------------------------------------------------------------
 
         elif packet.src == 0x0B and packet.cmdSet == 0x01 and packet.cmdId == 0x55:
-            self._logger.debug(
-                "%s: Device online → enabling config streaming",
-                self.address,
-            )
-            # Safe: _conn exists at this point
-            self._conn._add_task(self.set_config_flag(True))
+            if not self._cfg_enabled:
+                self._cfg_enabled = True
+                self._logger.debug(
+                    "%s: Device online → enabling config streaming",
+                    self.address,
+                )
+                self._conn._add_task(self.set_config_flag(True))
             processed = True
 
-        # Ping / keep-alive
         elif packet.src == 0x35 and packet.cmdSet == 0x35:
             processed = True
 
@@ -280,7 +274,7 @@ class Device(DeviceBase, ProtobufProps):
                 self.update_callback(field_name)
                 self.update_state(field_name, getattr(self, field_name))
             except Exception:
-                # Expected early on – telemetry is event-driven
+                # Expected until telemetry exists
                 self._logger.debug(
                     "%s: Field %s awaiting data",
                     self.address,
