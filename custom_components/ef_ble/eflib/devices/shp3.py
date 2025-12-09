@@ -108,7 +108,7 @@ class Device(DeviceBase, ProtobufProps):
     EcoFlow Smart Home Panel 3
     """
 
-    SN_PREFIX = b"P101"
+    SN_PREFIX = (b"P101", b"HR63")
     NAME_PREFIX = "EF-SHP3"
 
     NUM_OF_CIRCUITS = 32
