@@ -51,7 +51,7 @@ def _get_hall_value(pb: Any, idx: int, attr: str) -> float | None:
     ]
 
     base = 0
-    for idx_hall, hall in enumerate(halls, start=1):
+    for hall in halls:
         if not hall:
             continue
         if base <= idx < base + len(hall):
@@ -111,9 +111,9 @@ class Device(DeviceBase, ProtobufProps):
     """
     EcoFlow Smart Home Panel 3 (SHP3)
 
-    DEBUG BUILD:
-    - Logs raw ProtoTime / ProtoPushAndSet content
-    - Enables config streaming aggressively
+    DEBUG / BRING-UP BUILD:
+    - Logs decoded protobuf content
+    - Enables config streaming at the correct lifecycle point
     """
 
     SN_PREFIX = (b"P101", b"HR63")
@@ -178,9 +178,8 @@ class Device(DeviceBase, ProtobufProps):
     ) -> None:
         super().__init__(ble_dev, adv_data, sn)
         self._time_commands = TimeCommands(self)
-
-        # Assert config streaming once on startup
-        self._conn._add_task(self.set_config_flag(True))
+        # IMPORTANT:
+        # Do NOT touch self._conn here – it does not exist yet.
 
     # ---------------------------------------------------------------------
     # Packet parsing
@@ -192,19 +191,21 @@ class Device(DeviceBase, ProtobufProps):
 
         prev_error_count = self.error_count
 
+        # -----------------------------------------------------------------
+        # Primary telemetry
+        # -----------------------------------------------------------------
+
         if packet.src == 0x0B and packet.cmdSet == 0x0C:
             if packet.cmdId == 0x01:
                 await self._conn.replyPacket(packet)
                 self.update_from_bytes(pd303_pb2.ProtoTime, packet.payload)
 
-                # 🔍 DEBUG: dump decoded ProtoTime
+                # DEBUG – inspect ProtoTime content
                 self._logger.debug(
                     "%s: ProtoTime decoded:\n%s",
                     self.address,
                     pb_time,
                 )
-
-                # 🔍 DEBUG: log hall arrays explicitly
                 self._logger.debug(
                     "%s: hall1_watt=%s hall2_watt=%s hall3_watt=%s",
                     self.address,
@@ -222,7 +223,7 @@ class Device(DeviceBase, ProtobufProps):
                     packet.payload,
                 )
 
-                # 🔍 DEBUG: dump decoded ProtoPushAndSet
+                # DEBUG – inspect ProtoPushAndSet content
                 self._logger.debug(
                     "%s: ProtoPushAndSet decoded:\n%s",
                     self.address,
@@ -230,6 +231,10 @@ class Device(DeviceBase, ProtobufProps):
                 )
 
                 processed = True
+
+        # -----------------------------------------------------------------
+        # Time request
+        # -----------------------------------------------------------------
 
         elif (
             packet.src == 0x35
@@ -240,14 +245,20 @@ class Device(DeviceBase, ProtobufProps):
                 self._time_commands.async_send_all()
             processed = True
 
+        # -----------------------------------------------------------------
+        # Device online → enable config streaming (CORRECT PLACE)
+        # -----------------------------------------------------------------
+
         elif packet.src == 0x0B and packet.cmdSet == 0x01 and packet.cmdId == 0x55:
             self._logger.debug(
                 "%s: Device online → enabling config streaming",
                 self.address,
             )
+            # Safe: _conn exists at this point
             self._conn._add_task(self.set_config_flag(True))
             processed = True
 
+        # Ping / keep-alive
         elif packet.src == 0x35 and packet.cmdSet == 0x35:
             processed = True
 
@@ -269,7 +280,7 @@ class Device(DeviceBase, ProtobufProps):
                 self.update_callback(field_name)
                 self.update_state(field_name, getattr(self, field_name))
             except Exception:
-                # Expected early on – data not yet published
+                # Expected early on – telemetry is event-driven
                 self._logger.debug(
                     "%s: Field %s awaiting data",
                     self.address,
