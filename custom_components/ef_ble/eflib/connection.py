@@ -542,10 +542,11 @@ class Connection:
                 "parseEncPackets: Unable to parse encrypted packet - too small: %r"
             )
             self._logger.error(error_msg, bytearray(data).hex())
+            size = len(data) if data is not None else -1
             self._logger.debug(
                 "%s: Dropping short encrypted packet (%d bytes)",
                 self._address,
-                len(recv_data),
+                size,
             )
             return []
 
