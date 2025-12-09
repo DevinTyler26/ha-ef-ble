@@ -506,6 +506,14 @@ class Connection:
         payload_crc = data[data_end - 2 : data_end]
 
         # Check the payload CRC16
+        if len(payload_crc) < 2:
+            self._logger.debug(
+                "parseSimple: Dropping short simple packet (crc len=%d, payload=%s)",
+                len(payload_crc),
+                bytearray(payload_data).hex(),
+            )
+            return None
+
         if crc16(header + payload_data) != struct.unpack("<H", payload_crc)[0]:
             error_msg = (
                 "parseSimple: Unable to parse simple packet - incorrect CRC16: %r"
