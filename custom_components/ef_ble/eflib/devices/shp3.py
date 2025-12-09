@@ -87,8 +87,8 @@ class Device(DeviceBase, ProtobufProps):
     Control paths exist but are fail-closed by default.
     """
 
-    SN_PREFIX = b"HR63"
-    NAME_PREFIX = "EF-SHP-32"
+    SN_PREFIX = b"P101"
+    NAME_PREFIX = "EF-SHP3"
 
     NUM_OF_CIRCUITS = 32
     NUM_OF_CHANNELS = 3
