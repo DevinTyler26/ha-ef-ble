@@ -80,8 +80,8 @@ def _errors(error_codes: pd303_pb2.ErrCode):
 class Device(DeviceBase, ProtobufProps):
     """Smart Home Panel 2"""
 
-    SN_PREFIX = b"HD31"
-    NAME_PREFIX = "EF-HD3"
+    SN_PREFIX = (b"HD31", b"HR63")
+    NAME_PREFIX = ("EF-HD3", "EF-SHP3")
 
     NUM_OF_CIRCUITS = 12
     NUM_OF_CHANNELS = 3
