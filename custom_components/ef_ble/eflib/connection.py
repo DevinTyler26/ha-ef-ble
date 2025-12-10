@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import hashlib
 import logging
 import struct
@@ -41,6 +40,10 @@ MAX_CONNECTION_ATTEMPTS = 10
 DisconnectListener = Callable[[Exception | type[Exception] | None], None]
 
 
+# -----------------------------------------------------------------------------
+# Connection State
+# -----------------------------------------------------------------------------
+
 class ConnectionState(StrEnum):
     NOT_CONNECTED = auto()
     CREATED = auto()
@@ -58,8 +61,6 @@ class ConnectionState(StrEnum):
     ERROR_TIMEOUT = auto()
     ERROR_NOT_FOUND = auto()
     ERROR_BLEAK = auto()
-    ERROR_PACKET_PARSE = auto()
-    ERROR_SEND_REQUEST = auto()
     ERROR_UNKNOWN = auto()
     ERROR_AUTH_FAILED = auto()
     ERROR_TOO_MANY_ERRORS = auto()
@@ -80,7 +81,20 @@ class ConnectionState(StrEnum):
         ) or self.is_error()
 
 
+# -----------------------------------------------------------------------------
+# Connection
+# -----------------------------------------------------------------------------
+
 class Connection:
+    """
+    BLE connection + auth + packet handling.
+
+    This version is SHP3-tolerant:
+    - encrypted garbage is dropped softly
+    - prefix / CRC mismatches are not fatal
+    - logging API matches original integration
+    """
+
     NOTIFY_CHARACTERISTIC = "00000003-0000-1000-8000-00805f9b34fb"
     WRITE_CHARACTERISTIC = "00000002-0000-1000-8000-00805f9b34fb"
 
@@ -92,18 +106,19 @@ class Connection:
         data_parse: Callable[[Packet], Awaitable[bool]],
         packet_parse: Callable[[bytes], Awaitable[Packet]],
         on_state_change: Callable[[ConnectionState], None] = lambda _: None,
-    ):
+    ) -> None:
         self._ble_dev = ble_dev
         self._address = ble_dev.address
         self._dev_sn = dev_sn
         self._user_id = user_id
+
         self._data_parse = data_parse
         self._packet_parse = packet_parse
-
-        self._client: BleakClient | None = None
-        self._state = ConnectionState.CREATED
         self._on_state_change = on_state_change
 
+        self._client: BleakClient | None = None
+
+        self._state = ConnectionState.CREATED
         self._connected = asyncio.Event()
         self._disconnected = asyncio.Event()
 
@@ -111,18 +126,29 @@ class Connection:
         self._enc_packet_buffer = b""
 
         self._tasks: set[asyncio.Task] = set()
-        self._logger = ConnectionLogger(self)
 
         self._errors = 0
-        self._last_exception = None
+        self._last_exception: Exception | type[Exception] | None = None
 
-        self._session_key = None
+        self._private_key = None
+        self._public_key = None
         self._shared_key = None
+        self._session_key = None
         self._iv = None
 
-    # -------------------------------------------------------------------------
+        self._logger = ConnectionLogger(self)
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers (required by devicebase.py)
+    # ------------------------------------------------------------------
+
+    def with_logging_options(self, options: LogOptions):
+        self._logger.set_options(options)
+        return self
+
+    # ------------------------------------------------------------------
     # Encryption helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def decryptShared(self, data: bytes) -> bytes:
         aes = AES.new(self._shared_key, AES.MODE_CBC, self._iv)
@@ -136,15 +162,15 @@ class Connection:
         aes = AES.new(self._session_key, AES.MODE_CBC, self._iv)
         return aes.encrypt(pad(data, AES.block_size))
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Packet parsing
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def parseSimple(self, data: bytes) -> bytes | None:
         if len(data) < 8:
             return None
 
-        header = data[0:6]
+        header = data[:6]
         payload_len = struct.unpack("<H", header[4:6])[0]
         data_end = 6 + payload_len
 
@@ -155,7 +181,7 @@ class Connection:
         crc = data[data_end - 2 : data_end]
 
         if crc16(header + payload) != struct.unpack("<H", crc)[0]:
-            raise PacketParseError("Simple CRC mismatch")
+            raise PacketParseError("CRC mismatch")
 
         return payload
 
@@ -174,6 +200,11 @@ class Connection:
 
         while data:
             if not data.startswith(EncPacket.PREFIX):
+                self._logger.debug(
+                    "%s: dropping encrypted frame (bad prefix): %s",
+                    self._address,
+                    data.hex(),
+                )
                 return packets
 
             header = data[:6]
@@ -189,6 +220,10 @@ class Connection:
             data = data[data_end:]
 
             if crc16(header + payload) != struct.unpack("<H", crc)[0]:
+                self._logger.debug(
+                    "%s: dropping encrypted frame (CRC mismatch)",
+                    self._address,
+                )
                 continue
 
             try:
@@ -196,14 +231,19 @@ class Connection:
                 packet = await self._packet_parse(decrypted)
                 if packet:
                     packets.append(packet)
-            except Exception as exc:
-                self._logger.debug("Dropping encrypted frame: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.debug(
+                    "%s: dropping encrypted frame (parse error): %s",
+                    self._address,
+                    exc,
+                )
+                continue
 
         return packets
 
-    # -------------------------------------------------------------------------
-    # Sending / receiving
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
 
     async def sendRequest(self, data: bytes, handler=None):
         if not self._client or not self._client.is_connected:
@@ -233,9 +273,9 @@ class Connection:
         )
         await self.sendRequest(enc.toBytes(), handler)
 
-    # -------------------------------------------------------------------------
-    # Auth flow (unchanged but stabilized)
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Auth flow (unchanged semantics)
+    # ------------------------------------------------------------------
 
     async def initBleSessionKey(self):
         self._private_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP160r1)
@@ -247,12 +287,11 @@ class Connection:
             EncPacket.PAYLOAD_TYPE_VX_PROTOCOL,
             payload,
         )
-
         await self.sendRequest(enc.toBytes(), self.initBleSessionKeyHandler)
 
-    async def initBleSessionKeyHandler(self, _, recv):
+    async def initBleSessionKeyHandler(self, _char, recv):
         data = await self.parseSimple(bytes(recv))
-        if not data:
+        if not data or len(data) < 4:
             return
 
         size = getEcdhTypeSize(data[2])
@@ -263,8 +302,8 @@ class Connection:
         self._shared_key = ecdsa.ECDH(
             ecdsa.SECP160r1, self._private_key, dev_pub
         ).generate_sharedsecret_bytes()[:16]
-
         self._iv = hashlib.md5(self._shared_key).digest()
+
         await self.getKeyInfoReq()
 
     async def getKeyInfoReq(self):
@@ -275,9 +314,11 @@ class Connection:
         )
         await self.sendRequest(enc.toBytes(), self.getKeyInfoReqHandler)
 
-    async def getKeyInfoReqHandler(self, _, recv):
+    async def getKeyInfoReqHandler(self, _char, recv):
         try:
             data = await self.parseSimple(bytes(recv))
+            if not data:
+                return
             plain = await self.decryptShared(data[1:])
             self._session_key = hashlib.md5(plain).digest()
             await self.getAuthStatus()
@@ -288,7 +329,7 @@ class Connection:
         pkt = Packet(0x21, 0x35, 0x35, 0x89, b"", 0x01, 0x01, 0x03)
         await self.sendPacket(pkt, self.getAuthStatusHandler)
 
-    async def getAuthStatusHandler(self, _, recv):
+    async def getAuthStatusHandler(self, _char, recv):
         packets = await self.parseEncPackets(bytes(recv))
         if not packets:
             raise PacketReceiveError
@@ -301,14 +342,14 @@ class Connection:
         pkt = Packet(0x21, 0x35, 0x35, 0x86, payload, 0x01, 0x01, 0x03)
         await self.sendPacket(pkt, self.listenForDataHandler)
 
-    async def listenForDataHandler(self, _, recv):
+    async def listenForDataHandler(self, _char, recv):
         packets = await self.parseEncPackets(bytes(recv))
         for pkt in packets:
             await self._data_parse(pkt)
 
-    # -------------------------------------------------------------------------
-    # Task helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Task helper
+    # ------------------------------------------------------------------
 
     def _add_task(self, coro: Coroutine):
         task = asyncio.create_task(coro)
